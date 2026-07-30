@@ -1,14 +1,31 @@
 name: build-wda
-on: workflow_dispatch
+
+on:
+  workflow_dispatch:
+    inputs:
+      remove_swift_dylib:
+        description: '是否删除 libXCTestSwiftSupport.dylib (0=保留, 1=删除)'
+        required: false
+        default: '0'
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-15
+
     steps:
       - uses: actions/checkout@v4
 
+      # ---------- 0. 打印工具链信息 ----------
+      - name: Show toolchain
+        run: |
+          ls /Applications | grep -i xcode || true
+          xcodebuild -version
+          xcodebuild -showsdks | grep -i ios || true
+
+      # ---------- 1. 编译（不签名） ----------
       - name: Build for testing (unsigned)
         run: |
+          set -euo pipefail
           xcodebuild build-for-testing \
             -project WebDriverAgent.xcodeproj \
             -scheme WebDriverAgentRunner \
@@ -16,11 +33,80 @@ jobs:
             -derivedDataPath ./build \
             CODE_SIGNING_ALLOWED=NO
 
+      # ---------- 2. 清掉内嵌的 XCTest 框架 ----------
+      - name: Strip embedded XCTest frameworks
+        run: |
+          set -euo pipefail
+          APP="build/Build/Products/Debug-iphoneos/WebDriverAgentRunner-Runner.app"
+
+          echo "===== 清理前 ====="
+          ls -1 "$APP/Frameworks" || true
+
+          rm -rf "$APP"/Frameworks/XC*.framework
+
+          if [ "${{ github.event.inputs.remove_swift_dylib }}" = "1" ]; then
+            rm -f "$APP"/Frameworks/libXCTestSwiftSupport.dylib
+            echo ">>> 已删除 libXCTestSwiftSupport.dylib"
+          else
+            echo ">>> 保留 libXCTestSwiftSupport.dylib"
+          fi
+
+          echo "===== 清理后 ====="
+          ls -1 "$APP/Frameworks" 2>/dev/null || echo "(Frameworks 已空)"
+
+      # ---------- 3. Ad-hoc 签名，必须从内往外 ----------
+      - name: Ad-hoc codesign (inside-out)
+        run: |
+          set -euo pipefail
+          APP="build/Build/Products/Debug-iphoneos/WebDriverAgentRunner-Runner.app"
+          XC="$APP/PlugIns/WebDriverAgentRunner.xctest"
+
+          # 3.1 所有 dylib
+          find "$APP" -name "*.dylib" -print0 | while IFS= read -r -d '' f; do
+            echo "sign dylib     : $f"
+            codesign -f -s - "$f"
+          done
+
+          # 3.2 所有 framework（含 .xctest 内部的 WebDriverAgentLib）
+          find "$APP" -name "*.framework" -print0 | while IFS= read -r -d '' f; do
+            echo "sign framework : $f"
+            codesign -f -s - "$f"
+          done
+
+          # 3.3 xctest bundle 本体  ← 这就是之前漏签的那个
+          echo "sign xctest    : $XC"
+          codesign -f -s - "$XC"
+
+          # 3.4 最外层 app
+          echo "sign app       : $APP"
+          codesign -f -s - "$APP"
+
+      # ---------- 4. 验证 cdhash 确实存在 ----------
+      - name: Verify signatures
+        run: |
+          set -euo pipefail
+          APP="build/Build/Products/Debug-iphoneos/WebDriverAgentRunner-Runner.app"
+          XC="$APP/PlugIns/WebDriverAgentRunner.xctest"
+
+          echo "########## 内层 xctest 可执行文件（关键） ##########"
+          codesign -dv --verbose=4 "$XC/WebDriverAgentRunner" 2>&1
+
+          echo "########## xctest bundle ##########"
+          codesign -dv --verbose=4 "$XC" 2>&1
+
+          echo "########## 外层 app ##########"
+          codesign -dv --verbose=4 "$APP" 2>&1
+
+      # ---------- 5. 打包 ----------
       - name: Package into ipa
         run: |
+          set -euo pipefail
+          APP="build/Build/Products/Debug-iphoneos/WebDriverAgentRunner-Runner.app"
+          rm -rf Payload
           mkdir -p Payload
-          cp -r build/Build/Products/Debug-iphoneos/WebDriverAgentRunner-Runner.app Payload/
-          zip -qr WebDriverAgentRunner.ipa Payload
+          cp -a "$APP" Payload/
+          zip -qry WebDriverAgentRunner.ipa Payload
+          ls -lh WebDriverAgentRunner.ipa
 
       - uses: actions/upload-artifact@v4
         with:
